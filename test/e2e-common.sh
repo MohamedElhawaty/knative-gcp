@@ -40,16 +40,6 @@ export CONFIG_INVALID_CREDENTIAL="test/test_configs/invalid-credential.json"
 # Setup Knative GCP.
 function knative_setup() {
   start_knative_gcp || return 1
-  export_variable || return 1
-  control_plane_setup || return 1
-}
-
-# Tear down tmp files which store the private key.
-function test_teardown() {
-  if (( ! IS_PROW )); then
-    rm "${SOURCES_GSA_KEY_TEMP}"
-    rm "${BROKER_GSA_KEY_TEMP}"
-  fi
 }
 
 function publish_test_images() {
@@ -77,116 +67,6 @@ function storage_setup() {
   if (( ! IS_PROW )); then
     storage_admin_set_up "${E2E_PROJECT_ID}"
   fi
-}
-
-# Create resources required for Sources authentication setup.
-function sources_auth_setup() {
-  local auth_mode=${1}
-
-  if [ "${auth_mode}" == "secret" ]; then
-    if (( ! IS_PROW )); then
-      # When not running on Prow we need to set up a service account for sources.
-      echo "Set up the Sources ServiceAccount"
-      init_service_account_with_pubsub_editor "${E2E_PROJECT_ID}" "${SOURCES_GSA_NON_PROW}"
-      enable_monitoring "${E2E_PROJECT_ID}" "${SOURCES_GSA_NON_PROW}"
-      gcloud iam service-accounts keys create "${SOURCES_GSA_KEY_TEMP}" \
-        --iam-account="${SOURCES_GSA_NON_PROW}"@"${E2E_PROJECT_ID}".iam.gserviceaccount.com
-    else
-      delete_topics_and_subscriptions
-    fi
-    kubectl -n ${E2E_TEST_NAMESPACE} create secret generic "${SOURCES_GSA_SECRET_NAME}" --from-file=key.json="${SOURCES_GSA_KEY_TEMP}"
-  elif [ "${auth_mode}" == "workload_identity" ]; then
-    if (( ! IS_PROW )); then
-      # When not running on Prow we need to set up a service account for sources.
-      echo "Set up the Sources ServiceAccount"
-      init_service_account_with_pubsub_editor "${E2E_PROJECT_ID}" "${SOURCES_GSA_NON_PROW}"
-      enable_monitoring "${E2E_PROJECT_ID}" "${SOURCES_GSA_NON_PROW}"
-    else
-      delete_topics_and_subscriptions
-    fi
-  else
-    echo "Invalid parameter"
-  fi
-}
-
-# Create resources required for Broker authentication setup.
-function broker_auth_setup() {
-  echo "Authentication setup for GCP Broker"
-  local auth_mode=${1}
-
-  if [ "${auth_mode}" == "secret" ]; then
-    if (( ! IS_PROW )); then
-      init_service_account_with_pubsub_editor "${E2E_PROJECT_ID}" "${BROKER_GSA_NON_PROW}"
-      enable_monitoring "${E2E_PROJECT_ID}" "${BROKER_GSA_NON_PROW}"
-      gcloud iam service-accounts keys create "${BROKER_GSA_KEY_TEMP}" \
-        --iam-account="${BROKER_GSA_NON_PROW}"@"${E2E_PROJECT_ID}".iam.gserviceaccount.com
-    fi
-    kubectl -n "${CONTROL_PLANE_NAMESPACE}" create secret generic "${BROKER_GSA_SECRET_NAME}" --from-file=key.json="${BROKER_GSA_KEY_TEMP}"
-  elif [ "${auth_mode}" == "workload_identity" ]; then
-    if (( ! IS_PROW )); then
-      init_service_account_with_pubsub_editor "${E2E_PROJECT_ID}" "${BROKER_GSA_NON_PROW}"
-      enable_monitoring "${E2E_PROJECT_ID}" "${BROKER_GSA_NON_PROW}"
-      gcloud iam service-accounts add-iam-policy-binding \
-        --role roles/iam.workloadIdentityUser \
-        --member "${BROKER_MEMBER}" "${BROKER_GSA_EMAIL}"
-    else
-      gcloud iam service-accounts add-iam-policy-binding \
-        --role roles/iam.workloadIdentityUser \
-        --member "${BROKER_MEMBER}" \
-        --project "${PROW_PROJECT_NAME}" "${BROKER_GSA_EMAIL}"
-    fi
-    kubectl annotate --overwrite serviceaccount ${BROKER_SERVICE_ACCOUNT} iam.gke.io/gcp-service-account="${BROKER_GSA_EMAIL}" \
-      --namespace "${CONTROL_PLANE_NAMESPACE}"
-  else
-    echo "Invalid parameter"
-  fi
-
-  warmup_broker_setup || true
-}
-
-function prow_control_plane_setup() {
-  local auth_mode=${1}
-
-  if [ "${auth_mode}" == "secret" ]; then
-    echo "Create the control plane secret"
-    kubectl -n "${CONTROL_PLANE_NAMESPACE}" create secret generic "${CONTROLLER_GSA_SECRET_NAME}" --from-file=key.json="${CONTROLLER_GSA_KEY_TEMP}"
-    echo "Delete the controller pod in the namespace '${CONTROL_PLANE_NAMESPACE}' to refresh the created/patched secret"
-    kubectl delete pod -n "${CONTROL_PLANE_NAMESPACE}" --selector role=controller
-  elif [ "${auth_mode}" == "workload_identity" ]; then
-    cleanup_iam_policy_binding_members
-    # Allow the Kubernetes service account to use Google service account.
-    gcloud iam service-accounts add-iam-policy-binding \
-      --role roles/iam.workloadIdentityUser \
-      --member "${MEMBER}" \
-      --project "${PROW_PROJECT_NAME}" "${CONTROLLER_GSA_EMAIL}"
-    kubectl annotate --overwrite serviceaccount "${K8S_CONTROLLER_SERVICE_ACCOUNT}" iam.gke.io/gcp-service-account="${CONTROLLER_GSA_EMAIL}" \
-      --namespace "${CONTROL_PLANE_NAMESPACE}"
-    # Setup default credential information for Workload Identity.
-    sed "s/K8S_SERVICE_ACCOUNT_NAME/${K8S_SERVICE_ACCOUNT_NAME}/g; s/SOURCES-GOOGLE-SERVICE-ACCOUNT/${SOURCES_GSA_EMAIL}/g" ${CONFIG_GCP_AUTH} | ko apply -f -
-  else
-    echo "Invalid parameter"
-  fi
-}
-
-function cleanup_iam_policy_binding_members() {
-  # If the tests are run on Prow, clean up the member for roles/iam.workloadIdentityUser before running it.
-  members=$(gcloud iam service-accounts get-iam-policy \
-    --project="${PROW_PROJECT_NAME}" "${SOURCES_GSA_EMAIL}" \
-    --format="value(bindings.members)" \
-    --filter="bindings.role:roles/iam.workloadIdentityUser" \
-    --flatten="bindings[].members")
-  while read -r member_name
-  do
-    # Only delete the iam bindings that is related to the current boskos project.
-    if [ "$(cut -d'.' -f1 <<< "${member_name}")" == "serviceAccount:${E2E_PROJECT_ID}" ]; then
-      gcloud iam service-accounts remove-iam-policy-binding \
-        --role roles/iam.workloadIdentityUser \
-        --member "${member_name}" \
-        --project "${PROW_PROJECT_NAME}" "${SOURCES_GSA_EMAIL}"
-        # Add a sleep time between each get-set iam-policy-binding loop to avoid concurrency issue. Sleep time is based on the SLO.
-        sleep 10
-    fi
-  done <<< "$members"
 }
 
 function delete_topics_and_subscriptions() {
@@ -236,12 +116,12 @@ function test_authentication_check_for_brokercell() {
   wait_until_brokercell_authentication_check_pending "$(non_pod_check_keywords)" || return 1
 
   echo "Starting authentication check test which is running inside of the broker related Pods."
-  apply_invalid_auth "$auth_mode" || return 1
+  apply_invalid_auth || return 1
   wait_until_brokercell_authentication_check_pending "$(pod_check_keywords "$auth_mode")" || return 1
 
   # Clean up all the testing resources.
   echo "Authentication check test finished, waiting until all broker related testing resources deleted."
-  delete_invalid_auth "$auth_mode" || return 1
+  delete_invalid_auth || return 1
   kubectl delete -f "${CONFIG_WARMUP_GCP_BROKER}"
   kubectl delete brokercell default -n "${CONTROL_PLANE_NAMESPACE}"
   kubectl wait pod --for=delete -n "${CONTROL_PLANE_NAMESPACE}" --selector=brokerCell=default --timeout=5m || return 1
@@ -276,30 +156,6 @@ function pod_check_keywords() {
 
 function non_pod_check_keywords() {
   echo "authentication is not configured"
-}
-
-function apply_invalid_auth() {
-  local auth_mode=${1}
-  if [ "${auth_mode}" == "secret" ]; then
-    kubectl -n "${CONTROL_PLANE_NAMESPACE}" create secret generic "${BROKER_GSA_SECRET_NAME}" --from-file=key.json=${CONFIG_INVALID_CREDENTIAL}
-  elif [ "${auth_mode}" == "workload_identity" ]; then
-    kubectl -n "${CONTROL_PLANE_NAMESPACE}" annotate sa broker iam.gke.io/gcp-service-account=fakeserviceaccount@test-project.iam.gserviceaccount.com
-  else
-    echo "Invalid parameter"
-    return 1
-  fi
-}
-
-function delete_invalid_auth() {
-  local auth_mode=${1}
-  if [ "${auth_mode}" == "secret" ]; then
-    kubectl -n "${CONTROL_PLANE_NAMESPACE}" delete secret "${BROKER_GSA_SECRET_NAME}"
-  elif [ "${auth_mode}" == "workload_identity" ]; then
-    kubectl -n "${CONTROL_PLANE_NAMESPACE}" annotate sa broker iam.gke.io/gcp-service-account-
-  else
-    echo "Invalid parameter"
-    return 1
-  fi
 }
 
 # The warm-up broker serves the following purposes:
